@@ -1,0 +1,153 @@
+stages:
+  - tag
+  - sonarqube
+  - build
+  - deploy-compose
+  - push
+  - deploy-k8s
+
+variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+
+# Variables:
+#    TAG_LATEST: $CI_REGISTRY_IMAGE/$CI_COMMIT_REF_NAME:latest
+#   TAG_COMMIT: $CI_REGISTRY_IMAGE/$CI_COMMIT_REF_NAME:$CI_COMMIT_SHORT_SHA
+tag:
+   stage: tag
+   script:
+     - TAG=`git rev-parse --short=4  HEAD`
+     - echo "TAG=$TAG" >> build.env
+   artifacts:
+     reports:
+       dotenv: build.env
+
+sonarqube-check:
+  stage: sonarqube
+  image: sonarsource/sonar-scanner-cli:latest
+  script: 
+   - /opt/sonar-scanner/bin/sonar-scanner
+  Services:
+  - docker:20.10.16-dind
+
+
+build-ui:
+  stage: build
+  script: 
+      - cd ui && docker login -u $DOCKERHUB_USERNAME -p $DOCKERHUB_PASSWORD
+      - docker build -t $DOCKERHUB_USERNAME/s4-ui:$TAG .
+      - cd -
+  needs: [sonarqube-check]  
+  Services:
+  - docker:20.10.16-dind
+
+build-db:
+  stage: build
+  script:
+      - cd db && docker login -u $DOCKERHUB_USERNAME -p $DOCKERHUB_PASSWORD
+      - docker build -t $DOCKERHUB_USERNAME/s4-db:$TAG .
+      - cd -
+  needs: [sonarqube-check]  
+  Services:
+  - docker:20.10.16-dind
+
+build-auth:
+  stage: build
+  script: 
+      - cd auth && docker login -u $DOCKERHUB_USERNAME -p $DOCKERHUB_PASSWORD
+      - docker build -t $DOCKERHUB_USERNAME/s4-auth:$TAG .
+      - cd -
+  needs: [sonarqube-check]  
+  Services:
+  - docker:20.10.16-dind
+
+build-weather:
+  stage: build
+  image: docker:20.10.16
+  script: 
+      - cd weather && docker login -u $DOCKERHUB_USERNAME -p $DOCKERHUB_PASSWORD
+      - docker build -t $DOCKERHUB_USERNAME/s4-weather:$TAG .
+      - cd -
+  needs: [sonarqube-check]  
+  Services:
+  - docker:20.10.16-dind
+
+push:
+  stage: push
+  image: docker:20.10.16
+  script:
+      - 
+      - docker login -u $DOCKERHUB_USERNAME -p $DOCKERHUB_PASSWORD
+      - docker push $DOCKERHUB_USERNAME/s4-ui:$TAG
+      - docker push $DOCKERHUB_USERNAME/s4-db:$TAG
+      - docker push $DOCKERHUB_USERNAME/s4-auth:$TAG
+      - docker push $DOCKERHUB_USERNAME/s4-weather:$TAG
+  needs: [sonarqube-check]    
+  Services:
+  - docker:20.10.16-dind
+    
+  only:
+    - develop
+    - master
+deploy-compose:
+  stage: deploy-compose
+  needs: [build-ui,build-auth,build-db,build-weather]
+  script: |   
+     docker login -u $DOCKERHUB_USERNAME -p $DOCKERHUB_PASSWORD && TAG=`git rev-parse --short=4  HEAD`
+     cat <<EOF > docker-compose.yml
+        version: "3.9"
+        services:
+          auth:
+            restart: always
+            image: $DOCKERHUB_USERNAME/s4-auth:$TAG
+            depends_on:
+              - db
+            environment:
+              DB_HOST: db
+              DB_PASSWORD: my-secret-pw
+            networks:
+              - app-net
+          ui:
+            restart: always
+            image: $DOCKERHUB_USERNAME/s4-ui:$TAG
+            depends_on:
+              - auth
+              - weather
+            environment:
+              AUTH_HOST: auth
+              AUTH_PORT: 8080
+              WEATHER_HOST: weather
+              WEATHER_PORT: 5000
+            ports:
+              - "3000:3000"
+            networks:
+              - app-net
+          weather:
+            restart: always
+            image: $DOCKERHUB_USERNAME/s4-weather:$TAG
+            environment:
+              APIKEY: ecbc396f46mshb65cbb1f82cf334p1fcc87jsna5e962a3c542
+            networks:
+              - app-net
+          db:
+            restart: always
+            image: $DOCKERHUB_USERNAME/s4-db:$TAG
+            environment:
+              MYSQL_ROOT_PASSWORD: my-secret-pw
+            networks:
+              - app-net
+            volumes:
+              - ./db-data:/var/lib/mysql
+        networks:
+          app-net:
+            driver: bridge
+        volumes:
+          db-data:
+     EOF
+     cat docker-compose.yml 
+     docker-compose down || true 
+     docker-compose up -d
+    tags:
+      -n1shell
+    only:
+      - develop
+      - master
